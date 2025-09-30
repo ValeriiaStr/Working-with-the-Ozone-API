@@ -1,0 +1,209 @@
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Мои скрипты')                   // Создаём одно меню
+    .addItem('FBO', 'getOzonFboPostings')        // Добавляем первый пункт
+    .addItem('Реклама', 'fetchDailyCampaignStatistics') // Второй пункт меню
+    .addItem('FBS', 'getOzonOrders')   
+    .addItem('Аналитика', 'getFullOzonAnalyticsData') // Третий пункт (пример)
+    .addToUi();                                  // Добавляем меню в интерфейс
+}
+
+
+
+function getFullOzonAnalyticsData() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var techSheet = ss.getSheetByName('Технический');
+  if (!techSheet) {
+    Logger.log('Не найден лист "Технический".');
+    return;
+  }
+
+  // Читаем Client-Id и Api-Key
+  var clientId = String(techSheet.getRange('E1').getValue()).trim();
+  var apiKey = String(techSheet.getRange('E2').getValue()).trim();
+
+  if (!clientId || !apiKey) {
+    Logger.log('Ошибка: Client-Id или Api-Key не указаны.');
+    return;
+  }
+
+  // Читаем даты
+  var dateFromValue = techSheet.getRange('J2').getValue();
+  var dateToValue = techSheet.getRange('K2').getValue();
+
+  function formatDate(date) {
+    if (date instanceof Date) {
+      return Utilities.formatDate(date, "GMT", "yyyy-MM-dd");
+    } else if (typeof date === "string") {
+      return date.split(' ')[0]; // убираем время, если есть
+    } else {
+      return '';
+    }
+  }
+
+  var dateFrom = formatDate(dateFromValue);
+  var dateTo = formatDate(dateToValue);
+
+  if (!dateFrom || !dateTo) {
+    Logger.log('Ошибка: неверный формат дат.');
+    return;
+  }
+
+  // Измерения (dimensions)
+  var dimensions = [
+    "day",     // дата
+    "sku",     // id товара
+    "category" // название ( category нет в API — но в документации так и прописано)
+  ];
+
+  // Метрики
+  var metrics = [
+    "revenue",
+    "ordered_units",
+    "hits_view",
+    "hits_tocart_search",
+    "hits_tocart_pdp",
+    "hits_tocart",
+    "session_view_search",
+    "session_view_pdp",
+    "session_view",
+    "returns",
+    "cancellations",
+    "delivered_units",
+    "position_category"
+  ];
+
+  if (metrics.length > 14) {
+    Logger.log("Количество метрик превышает 14. Уменьшите выбор.");
+    return;
+  }
+
+  var url = 'https://api-seller.ozon.ru/v1/analytics/data';
+
+  var headers = {
+    "Client-Id": clientId,
+    "Api-Key": apiKey,
+    "Content-Type": "application/json"
+  };
+
+  var limit = 1000;
+  var offset = 0;
+  var allData = [];
+
+  while (true) {
+    var requestBody = {
+      date_from: dateFrom,
+      date_to: dateTo,
+      dimension: dimensions,
+      metrics: metrics,
+      filters: [],
+      sort: [],
+      limit: limit,
+      offset: offset
+    };
+
+    var options = {
+      method: 'post',
+      headers: headers,
+      contentType: 'application/json',
+      muteHttpExceptions: true,
+      payload: JSON.stringify(requestBody)
+    };
+
+    try {
+      var response = UrlFetchApp.fetch(url, options);
+      var code = response.getResponseCode();
+      var content = response.getContentText();
+
+      if (code !== 200) {
+        Logger.log('Ошибка API, код: ' + code + ', ответ: ' + content);
+        return;
+      }
+
+      var json = JSON.parse(content);
+
+      if (!json.result || !json.result.data || json.result.data.length === 0) {
+        // Данные закончились
+        break;
+      }
+
+      var data = json.result.data;
+      allData = allData.concat(data);
+
+      Logger.log('Получено строк: ' + data.length + ', всего загружено: ' + allData.length);
+
+      if (data.length < limit) {
+        // Меньше лимита — значит пришли последние строки
+        break;
+      }
+
+      offset += limit;
+
+    } catch (e) {
+      Logger.log('Ошибка выполнения: ' + e.message);
+      return;
+    }
+  }
+
+  if (allData.length === 0) {
+    Logger.log('Нет данных для выгрузки.');
+    return;
+  }
+
+  Logger.log('Всего строк для записи: ' + allData.length);
+
+  var analyticsSheetName = 'Аналитика';
+  var analyticsSheet = ss.getSheetByName(analyticsSheetName);
+  if (!analyticsSheet) {
+    analyticsSheet = ss.insertSheet(analyticsSheetName);
+  }
+  analyticsSheet.clearContents();
+
+  // Заголовки: дата, id, name + метрики
+  var headersRow = ['date', 'id', 'name'].concat(metrics);
+  analyticsSheet.appendRow(headersRow);
+
+  var output = [];
+
+  allData.forEach(function(item, index) {
+    var dateVal = '';
+    var idVal = '';
+    var nameVal = '';
+
+    if (item.dimensions && Array.isArray(item.dimensions)) {
+      if (item.dimensions.length >= 2) {
+        var dateDim = item.dimensions[0];
+        var productDim = item.dimensions[1];
+
+        dateVal = dateDim.id || '';
+        idVal = productDim.id || '';
+        nameVal = productDim.name || '';
+      }
+    }
+
+    var row = [dateVal, idVal, nameVal];
+
+    if (item.metrics && item.metrics.length === metrics.length) {
+      item.metrics.forEach(function(val) {
+        row.push(val);
+      });
+    } else {
+      for (var i = 0; i < metrics.length; i++) {
+        row.push('');
+      }
+      if (!item.metrics) {
+        Logger.log('У элемента ' + index + ' отсутствует поле metrics.');
+      } else {
+        Logger.log('Неверная длина metrics у элемента ' + index);
+      }
+    }
+
+    output.push(row);
+  });
+
+  if (output.length > 0) {
+    analyticsSheet.getRange(2, 1, output.length, headersRow.length).setValues(output);
+  }
+
+  Logger.log('Данные успешно выгружены.');
+}
